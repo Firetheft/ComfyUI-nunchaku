@@ -75,7 +75,13 @@ class ComfyQwenImageWrapper(nn.Module):
         on-the-fly before inference.
         """
 
-        timestep_float = timestep.item() if isinstance(timestep, torch.Tensor) else float(timestep)
+        if isinstance(timestep, torch.Tensor):
+            if timestep.numel() == 1:
+                timestep_float = timestep.item()
+            else:
+                timestep_float = timestep.flatten()[0].item()
+        else:
+            timestep_float = float(timestep)
 
         # Check if the LoRA stack has been changed by a loader node
         loras_changed = self._applied_loras != self.loras
