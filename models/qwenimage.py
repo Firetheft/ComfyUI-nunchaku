@@ -815,6 +815,9 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
                     h = max(h, ref.shape[-2] + h_offset)
                     w = max(w, ref.shape[-1] + w_offset)
 
+                if ref.device != device:
+                    ref = ref.to(device)
+
                 kontext, kontext_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
                 hidden_states = torch.cat([hidden_states, kontext], dim=1)
                 img_ids = torch.cat([img_ids, kontext_ids], dim=1)
@@ -848,12 +851,12 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
 
         hidden_states = self.img_in(hidden_states)
 
-        timesteps = timesteps.to(hidden_states.dtype)
+        timesteps = timesteps.to(device=device, dtype=hidden_states.dtype)
         encoder_hidden_states = self.txt_norm(context)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
         if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
+            guidance = guidance.to(device=device, dtype=hidden_states.dtype) * 1000
 
         temb = (
             self.time_text_embed(timesteps, hidden_states)

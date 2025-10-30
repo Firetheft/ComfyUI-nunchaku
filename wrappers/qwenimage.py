@@ -3,10 +3,14 @@ from pathlib import Path
 
 import torch
 from torch import nn
+import comfy.model_management
+import logging
 
 from nunchaku import NunchakuQwenImageTransformer2DModel
 from nunchaku.caching.fbcache import cache_context, create_cache_context
 from ..nunchaku_code.lora_qwen import compose_loras_v2, reset_lora_v2
+
+logger = logging.getLogger(__name__)
 
 
 class ComfyQwenImageWrapper(nn.Module):
@@ -19,11 +23,13 @@ class ComfyQwenImageWrapper(nn.Module):
     """
 
     def __init__(
-        self,
-        model: NunchakuQwenImageTransformer2DModel,
-        config,
-        customized_forward: Callable = None,
-        forward_kwargs: dict | None = None,
+            self,
+            model: NunchakuQwenImageTransformer2DModel,
+            config,
+            customized_forward: Callable = None,
+            forward_kwargs: dict | None = None,
+            cpu_offload_setting: str = "auto",
+            vram_margin_gb: float = 4.0
     ):
         super().__init__()
         self.model = model
@@ -33,6 +39,9 @@ class ComfyQwenImageWrapper(nn.Module):
         self.loras: List[Tuple[Union[str, Path, dict], float]] = []
         # This tracks the LoRAs currently composed into the model to detect changes
         self._applied_loras: List[Tuple[Union[str, Path, dict], float]] = None
+
+        self.cpu_offload_setting = cpu_offload_setting
+        self.vram_margin_gb = vram_margin_gb
 
         self.customized_forward = customized_forward
         self.forward_kwargs = forward_kwargs or {}
@@ -56,17 +65,16 @@ class ComfyQwenImageWrapper(nn.Module):
             self.model.to(device)
         return self
 
-
     def forward(
-        self,
-        x,
-        timestep,
-        context=None,
-        y=None,
-        guidance=None,
-        control=None,
-        transformer_options={},
-        **kwargs,
+            self,
+            x,
+            timestep,
+            context=None,
+            y=None,
+            guidance=None,
+            control=None,
+            transformer_options={},
+            **kwargs,
     ):
         """
         Forward pass for the wrapped model.
@@ -74,7 +82,6 @@ class ComfyQwenImageWrapper(nn.Module):
         Detects changes to the `self.loras` list and recomposes the model
         on-the-fly before inference.
         """
-
         if isinstance(timestep, torch.Tensor):
             if timestep.numel() == 1:
                 timestep_float = timestep.item()
@@ -83,41 +90,85 @@ class ComfyQwenImageWrapper(nn.Module):
         else:
             timestep_float = float(timestep)
 
-        # Check if the LoRA stack has been changed by a loader node
-        loras_changed = self._applied_loras != self.loras
-        
-        # Additional checks: check if the underlying model is "dirty" (lora applied),
-        # But this wrapper instance expects it to be clean (the loras list is empty).
-        # This handles state out-of-sync issues caused by model deepcopy.
+
         model_is_dirty = (
             not self.loras and # We expect no LoRA
             hasattr(self.model, "_lora_slots") and self.model._lora_slots # But the model actually has LoRA
         )
-
-        if loras_changed or model_is_dirty:
+        # Check if the LoRA stack has been changed by a loader node
+        if self._applied_loras != self.loras or model_is_dirty:
             # The compose function handles resetting before applying the new stack
             reset_lora_v2(self.model)
             self._applied_loras = self.loras.copy()
+
+            # --- NEW DYNAMIC VRAM CHECK (conditionally applied) ---
+
+            # 1. Check if offload is *already* enabled (from loader setting "enable" or "auto" on low-vram)
+            offload_is_on = hasattr(self.model, "offload_manager") and self.model.offload_manager is not None
+
+            # 2. Decide if we *need* to turn it on
+            should_enable_offload = offload_is_on
+
+            # 3. Only run the dynamic VRAM check if:
+            #    - The user's original setting was "auto"
+            #    - Offloading is not *already* on
+            #    - We are actually loading new LoRAs
+            if self.cpu_offload_setting == "auto" and not offload_is_on and self.loras:
+                try:
+                    # Use the VRAM margin from the loader node
+                    free_vram_gb = comfy.model_management.get_free_memory() / (1024 ** 3)
+
+                    if free_vram_gb < self.vram_margin_gb:
+                        logger.info(
+                            f"Free VRAM is {free_vram_gb:.2f}GB (below safety margin of {self.vram_margin_gb}GB) and 'cpu_offload' is 'auto'. Force-enabling CPU offload for LoRA composition.")
+                        should_enable_offload = True
+                    else:
+                        logger.info(
+                            f"Free VRAM is {free_vram_gb:.2f}GB (>= {self.vram_margin_gb}GB margin). LoRAs will be composed without enabling CPU offload.")
+
+                except Exception as e:
+                    logger.error(f"Error during VRAM check for LoRA offloading: {e}. Offload will not be enabled.")
+            elif self.cpu_offload_setting == "disable" and not offload_is_on:
+                logger.debug("CPU offload is 'disable' and not on. Skipping VRAM check.")
+            elif self.cpu_offload_setting == "enable" and offload_is_on:
+                logger.debug("CPU offload is 'enable'. Will rebuild offload manager for LoRAs.")
+
+            # --- END NEW VRAM CHECK ---
+
+            # 4. Compose LoRAs. This changes internal tensor shapes.
             compose_loras_v2(self.model, self.loras)
 
-            # BUG FIX v2: Force a full teardown and rebuild of the OffloadManager
-            if hasattr(self.model, "offload_manager") and self.model.offload_manager is not None:
-                # Store the settings from the old manager before destroying it
-                manager = self.model.offload_manager
-                offload_settings = {
-                    "num_blocks_on_gpu": manager.num_blocks_on_gpu,
-                    "use_pin_memory": manager.use_pin_memory,
-                }
+            # 5. Re-build offload manager if it's supposed to be on
+            # This block now runs if offload was on *or* if our new check decided to turn it on.
+            if should_enable_offload:
 
-                # Step 1: Completely disable and clear the old offloader
+                # Store settings if it was already on, otherwise use defaults
+                if offload_is_on:
+                    manager = self.model.offload_manager
+                    offload_settings = {
+                        "num_blocks_on_gpu": manager.num_blocks_on_gpu,
+                        "use_pin_memory": manager.use_pin_memory,
+                    }
+                else:
+                    # Not previously on, so use defaults from nodes/models/qwenimage.py
+                    offload_settings = {
+                        "num_blocks_on_gpu": 1,
+                        "use_pin_memory": False,  # 'disable' maps to False
+                    }
+                    logger.info("Building new CPU offload manager due to LoRA VRAM check.")
+
+                # Step 1: Completely disable and clear any old offloader (safe to call even if off)
                 self.model.set_offload(False)
 
-                # Step 2: Re-enable offloading, forcing it to rebuild
-                # with the new tensor shapes and the original settings.
+                # Step 2: Re-enable offloading with the correct settings
+                # This builds the manager based on the *newly composed* tensor shapes.
                 self.model.set_offload(True, **offload_settings)
 
+            # --- END MODIFIED SECTION ---
+
         # Caching logic
-        use_caching = getattr(self.model, "residual_diff_threshold_multi", 0) != 0 or getattr(self.model, "_is_cached", False)
+        use_caching = getattr(self.model, "residual_diff_threshold_multi", 0) != 0 or getattr(self.model, "_is_cached",
+                                                                                              False)
         if use_caching:
             cache_invalid = self._prev_timestep is None or self._prev_timestep < timestep_float + 1e-5
             if cache_invalid:
@@ -136,25 +187,43 @@ class ComfyQwenImageWrapper(nn.Module):
             out = out.unsqueeze(2)
 
         return out
-
+    
     def _execute_model(self, x, timestep, context, guidance, control, transformer_options, **kwargs):
-        """Helper function to run the model's forward pass."""
-        model_device = next(self.model.parameters()).device
+        """
+        Helper function to run the model's forward pass.
+        Includes round-trip device logic for RES4LYF + CPU Offload compatibility.
+        """
 
-        # Move input tensors to the model's device
-        if x.device != model_device:
-            x = x.to(model_device)
-        if context is not None and context.device != model_device:
-            context = context.to(model_device)
+        original_device = x.device
 
-        # Keep original input shape check
+        compute_device = comfy.model_management.get_torch_device()
+
+        if x.device != compute_device:
+            x = x.to(compute_device)
+        if context is not None and context.device != compute_device:
+            context = context.to(compute_device)
+
+        if guidance is not None and guidance.device != compute_device:
+            guidance = guidance.to(compute_device)
+        if timestep is not None and isinstance(timestep, torch.Tensor) and timestep.device != compute_device:
+            timestep = timestep.to(compute_device)
+
+        kwargs_on_compute = {}
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor) and v.device != compute_device:
+                kwargs_on_compute[k] = v.to(compute_device)
+            elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                kwargs_on_compute[k] = [t.to(compute_device) if t.device != compute_device else t for t in v]
+            else:
+                kwargs_on_compute[k] = v
+
         input_is_5d = x.ndim == 5
         if input_is_5d:
             x = x.squeeze(2)
 
         if self.customized_forward:
             with torch.inference_mode():
-                return self.customized_forward(
+                out = self.customized_forward(
                     self.model,
                     hidden_states=x,
                     encoder_hidden_states=context,
@@ -163,16 +232,28 @@ class ComfyQwenImageWrapper(nn.Module):
                     control=control,
                     transformer_options=transformer_options,
                     **self.forward_kwargs,
-                    **kwargs,
+                    **kwargs_on_compute,
                 )
         else:
             with torch.inference_mode():
-                return self.model(
+                out = self.model(
                     hidden_states=x,
                     encoder_hidden_states=context,
                     timestep=timestep,
                     guidance=guidance if self.config.get("guidance_embed", False) else None,
                     control=control,
                     transformer_options=transformer_options,
-                    **kwargs,
+                    **kwargs_on_compute,
                 )
+
+        if isinstance(out, tuple):
+            out = out[0]
+
+
+        if out.device != original_device:
+            out = out.to(original_device)
+
+        if x.ndim == 5 and out.ndim == 4:
+            out = out.unsqueeze(2).to(original_device)
+
+        return out
