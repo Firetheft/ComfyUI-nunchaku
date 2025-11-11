@@ -4,6 +4,11 @@ This module implements the Nunchaku Qwen-Image model and related components.
 .. note::
 
     Inherits and modifies from https://github.com/comfyanonymous/ComfyUI/blob/v0.3.51/comfy/ldm/qwen_image/model.py
+
+.. warning::
+
+    There is a sage-attention dispatch bug that may cause black images until the upstream issue is fixed.
+    See: https://github.com/comfyanonymous/ComfyUI/issues/9773
 """
 
 import gc
@@ -537,6 +542,8 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
         Module providing normalization and linear layers.
     scale_shift : float, optional
         Value added to scale in modulation (default: 1.0).
+    transformer_offload_device: torch.device, optional
+        If not None, transformer blocks will be initialized to this device (usually cpu) rather than `device`
     **kwargs
         Additional arguments for quantized linear layers.
     """
@@ -558,6 +565,7 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
         device=None,
         operations=None,
         scale_shift: float = 1.0,
+        transformer_offload_device=None,
         **kwargs,
     ):
         super(QwenImageTransformer2DModel, self).__init__()
@@ -601,7 +609,7 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     dtype=dtype,
-                    device=device,
+                    device=transformer_offload_device if transformer_offload_device is not None else device,
                     operations=operations,
                     scale_shift=scale_shift,
                     **kwargs,
@@ -815,9 +823,6 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
                     h = max(h, ref.shape[-2] + h_offset)
                     w = max(w, ref.shape[-1] + w_offset)
 
-                if ref.device != device:
-                    ref = ref.to(device)
-
                 kontext, kontext_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
                 hidden_states = torch.cat([hidden_states, kontext], dim=1)
                 img_ids = torch.cat([img_ids, kontext_ids], dim=1)
@@ -851,12 +856,12 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
 
         hidden_states = self.img_in(hidden_states)
 
-        timesteps = timesteps.to(device=device, dtype=hidden_states.dtype)
+        timesteps = timesteps.to(hidden_states.dtype)
         encoder_hidden_states = self.txt_norm(context)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
         if guidance is not None:
-            guidance = guidance.to(device=device, dtype=hidden_states.dtype) * 1000
+            guidance = guidance.to(hidden_states.dtype) * 1000
 
         temb = (
             self.time_text_embed(timesteps, hidden_states)

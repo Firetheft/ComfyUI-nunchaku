@@ -187,43 +187,25 @@ class ComfyQwenImageWrapper(nn.Module):
             out = out.unsqueeze(2)
 
         return out
-    
+
     def _execute_model(self, x, timestep, context, guidance, control, transformer_options, **kwargs):
-        """
-        Helper function to run the model's forward pass.
-        Includes round-trip device logic for RES4LYF + CPU Offload compatibility.
-        """
+        """Helper function to run the model's forward pass."""
+        model_device = next(self.model.parameters()).device
 
-        original_device = x.device
+        # Move input tensors to the model's device
+        if x.device != model_device:
+            x = x.to(model_device)
+        if context is not None and context.device != model_device:
+            context = context.to(model_device)
 
-        compute_device = comfy.model_management.get_torch_device()
-
-        if x.device != compute_device:
-            x = x.to(compute_device)
-        if context is not None and context.device != compute_device:
-            context = context.to(compute_device)
-
-        if guidance is not None and guidance.device != compute_device:
-            guidance = guidance.to(compute_device)
-        if timestep is not None and isinstance(timestep, torch.Tensor) and timestep.device != compute_device:
-            timestep = timestep.to(compute_device)
-
-        kwargs_on_compute = {}
-        for k, v in kwargs.items():
-            if isinstance(v, torch.Tensor) and v.device != compute_device:
-                kwargs_on_compute[k] = v.to(compute_device)
-            elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
-                kwargs_on_compute[k] = [t.to(compute_device) if t.device != compute_device else t for t in v]
-            else:
-                kwargs_on_compute[k] = v
-
+        # Keep original input shape check
         input_is_5d = x.ndim == 5
         if input_is_5d:
             x = x.squeeze(2)
 
         if self.customized_forward:
             with torch.inference_mode():
-                out = self.customized_forward(
+                return self.customized_forward(
                     self.model,
                     hidden_states=x,
                     encoder_hidden_states=context,
@@ -232,28 +214,16 @@ class ComfyQwenImageWrapper(nn.Module):
                     control=control,
                     transformer_options=transformer_options,
                     **self.forward_kwargs,
-                    **kwargs_on_compute,
+                    **kwargs,
                 )
         else:
             with torch.inference_mode():
-                out = self.model(
+                return self.model(
                     hidden_states=x,
                     encoder_hidden_states=context,
                     timestep=timestep,
                     guidance=guidance if self.config.get("guidance_embed", False) else None,
                     control=control,
                     transformer_options=transformer_options,
-                    **kwargs_on_compute,
+                    **kwargs,
                 )
-
-        if isinstance(out, tuple):
-            out = out[0]
-
-
-        if out.device != original_device:
-            out = out.to(original_device)
-
-        if x.ndim == 5 and out.ndim == 4:
-            out = out.unsqueeze(2).to(original_device)
-
-        return out
