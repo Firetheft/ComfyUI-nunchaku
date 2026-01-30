@@ -216,6 +216,9 @@ class ZImageModelPatcher(ModelPatcher):
                                     self.patch_weight_to_device(weight_key)
                                 else:
                                     _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                                    if not hasattr(m, "weight_function"):
+                                        m.weight_function = []
+                                    
                                     m.weight_function.append(
                                         LowVramPatch(weight_key, self.patches, convert_func, set_func)
                                     )
@@ -225,6 +228,9 @@ class ZImageModelPatcher(ModelPatcher):
                                     self.patch_weight_to_device(bias_key)
                                 else:
                                     _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                                    if not hasattr(m, "bias_function"):
+                                        m.bias_function = []
+                                        
                                     m.bias_function.append(LowVramPatch(bias_key, self.patches, convert_func, set_func))
                                     patch_counter += 1
                             cast_weight = True

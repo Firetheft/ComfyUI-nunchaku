@@ -77,8 +77,8 @@ def load_diffusion_model_state_dict(
     new_sd = sd
 
     unet_weight_dtype = list(model_config.supported_inference_dtypes)
-    if model_config.scaled_fp8 is not None:
-        weight_dtype = None
+    # if model_config.scaled_fp8 is not None:
+    #     weight_dtype = None
 
     if dtype is None:
         unet_dtype = model_management.unet_dtype(
@@ -143,6 +143,16 @@ class NunchakuQwenImageDiTLoader:
                 ),
             },
             "optional": {
+                "vram_margin_gb": (
+                    "FLOAT",
+                    {
+                        "default": 4.0,
+                        "min": 0.0,
+                        "max": 64.0,
+                        "step": 0.1,
+                        "tooltip": "Set a VRAM safety margin (in GB). If 'auto' offload is on and free VRAM drops below this margin when loading LoRAs, CPU offload will be dynamically enabled."
+                    },
+                ),
                 "num_blocks_on_gpu": (
                     "INT",
                     {
@@ -174,7 +184,7 @@ class NunchakuQwenImageDiTLoader:
     TITLE = "Nunchaku Qwen-Image DiT Loader"
 
     def load_model(
-        self, model_name: str, cpu_offload: str, num_blocks_on_gpu: int = 1, use_pin_memory: str = "disable", **kwargs
+        self, model_name: str, cpu_offload: str, num_blocks_on_gpu: int = 1, use_pin_memory: str = "disable", vram_margin_gb: float = 4.0, **kwargs
     ):
         """
         Load the Qwen-Image model from file and return a patched model.
@@ -222,5 +232,19 @@ class NunchakuQwenImageDiTLoader:
             model.model.diffusion_model.set_offload(
                 cpu_offload_enabled, num_blocks_on_gpu=num_blocks_on_gpu, use_pin_memory=use_pin_memory == "enable"
             )
+
+        from ...models.qwenimage import NunchakuQwenImageTransformer2DModel
+        from ...wrappers.qwenimage import ComfyQwenImageWrapper
+
+        if isinstance(model.model.diffusion_model, NunchakuQwenImageTransformer2DModel):
+            if not isinstance(model.model.diffusion_model, ComfyQwenImageWrapper):
+                wrapper = ComfyQwenImageWrapper(
+                    model=model.model.diffusion_model,
+                    config=model.model.model_config.unet_config,
+                    cpu_offload_setting=cpu_offload,
+                    vram_margin_gb=vram_margin_gb
+                )
+                model.model.diffusion_model = wrapper
+                logger.debug("Wrapped transformer in ComfyQwenImageWrapper for LoRA support")
 
         return (model,)
