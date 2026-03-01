@@ -39,6 +39,31 @@ def add_comfy_cast_weights_attr(svdq_linear: SVDQW4A4Linear, comfy_linear: nn.Li
         svdq_linear.weight = None
 
 
+def _svdq_linear_from_linear(linear: nn.Linear, torch_dtype: torch.dtype, **kwargs) -> SVDQW4A4Linear:
+    """
+    Safe replacement for ``SVDQW4A4Linear.from_linear()`` that works when
+    ``linear.weight`` is ``None``.
+
+    On Windows with DynamicVRAM (aimdo) enabled, ComfyUI creates linear layers
+    with ``weight = None`` and populates them later via ``load_state_dict``.
+    ``from_linear`` unconditionally evaluates ``linear.weight.dtype`` and
+    ``linear.weight.device`` (Python eager argument evaluation), crashing when
+    the weight has not been materialised yet.  This helper constructs
+    ``SVDQW4A4Linear`` directly, passing ``device=None`` when weight is absent
+    to match the null-device used at layer creation time.
+    """
+    weight = linear.weight
+    device = weight.device if weight is not None else None
+    return SVDQW4A4Linear(
+        in_features=linear.in_features,
+        out_features=linear.out_features,
+        bias=linear.bias is not None,
+        torch_dtype=torch_dtype,
+        device=device,
+        **kwargs,
+    )
+
+
 def fuse_to_svdquant_linear(comfy_linear1: nn.Linear, comfy_linear2: nn.Linear, **kwargs) -> SVDQW4A4Linear:
     """
     Fuse two linear modules into one SVDQW4A4Linear.
@@ -59,14 +84,16 @@ def fuse_to_svdquant_linear(comfy_linear1: nn.Linear, comfy_linear2: nn.Linear, 
     """
     assert comfy_linear1.in_features == comfy_linear2.in_features
     assert comfy_linear1.bias is None and comfy_linear2.bias is None
-    torch_dtype = kwargs.pop("torch_dtype", comfy_linear1.weight.dtype)
+    weight = comfy_linear1.weight
+    torch_dtype = kwargs.get("torch_dtype", weight.dtype if weight is not None else None)
+    kw = {k: v for k, v in kwargs.items() if k != "torch_dtype"}
     svdq_linear = SVDQW4A4Linear(
         comfy_linear1.in_features,
         comfy_linear1.out_features + comfy_linear2.out_features,
         bias=False,
         torch_dtype=torch_dtype,
-        device=comfy_linear1.weight.device,
-        **kwargs,
+        device=weight.device if weight is not None else None,
+        **kw,
     )
     add_comfy_cast_weights_attr(svdq_linear, comfy_linear1)
     return svdq_linear
@@ -130,9 +157,12 @@ class ComfyNunchakuZImageAttention(JointAttention):
         self.n_rep = orig_attn.n_rep
         self.head_dim = orig_attn.head_dim
 
-        self.qkv = SVDQW4A4Linear.from_linear(orig_attn.qkv, **kwargs)
+        torch_dtype = kwargs.get("torch_dtype")
+        kw = {k: v for k, v in kwargs.items() if k != "torch_dtype"}
+
+        self.qkv = _svdq_linear_from_linear(orig_attn.qkv, torch_dtype, **kw)
         add_comfy_cast_weights_attr(self.qkv, orig_attn.qkv)
-        self.out = SVDQW4A4Linear.from_linear(orig_attn.out, **kwargs)
+        self.out = _svdq_linear_from_linear(orig_attn.out, torch_dtype, **kw)
         add_comfy_cast_weights_attr(self.out, orig_attn.out)
 
         self.q_norm = orig_attn.q_norm
@@ -197,8 +227,10 @@ class ComfyNunchakuZImageFeedForward(nn.Module):
 
     def __init__(self, orig_ff: FeedForward, **kwargs):
         super().__init__()
-        self.w13 = fuse_to_svdquant_linear(orig_ff.w1, orig_ff.w3, **kwargs)
-        self.w2 = SVDQW4A4Linear.from_linear(orig_ff.w2, **kwargs)
+        torch_dtype = kwargs.get("torch_dtype")
+        kw = {k: v for k, v in kwargs.items() if k != "torch_dtype"}
+        self.w13 = fuse_to_svdquant_linear(orig_ff.w1, orig_ff.w3, torch_dtype=torch_dtype, **kw)
+        self.w2 = _svdq_linear_from_linear(orig_ff.w2, torch_dtype, **kw)
         add_comfy_cast_weights_attr(self.w2, orig_ff.w2)
 
     def _forward_silu_gating(self, x1, x3):
